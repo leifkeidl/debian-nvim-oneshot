@@ -1,0 +1,318 @@
+# Paste into SSH as root (or: su -). Fresh Debian friendly.
+bash -euxo pipefail <<'SCRIPT'
+
+# ---------- must be root ----------
+if [ "$(id -u)" -ne 0 ]; then
+  echo "ERROR: Run as root (su -) or use sudo -i." >&2
+  exit 1
+fi
+
+# ---------- ask for target username (TTY-safe; no spam loop) ----------
+if [ ! -r /dev/tty ]; then
+  echo "ERROR: No interactive TTY available, can't prompt." >&2
+  echo "Run non-interactively like: TARGET_USER=youruser <paste again>" >&2
+  exit 1
+fi
+
+printf "Enter target username (must already exist): " > /dev/tty
+IFS= read -r USER_NAME < /dev/tty || USER_NAME=""
+
+if [ -z "${USER_NAME:-}" ]; then
+  echo "ERROR: Empty username." >&2
+  exit 1
+fi
+
+if ! id -u "$USER_NAME" >/dev/null 2>&1; then
+  echo "ERROR: User '$USER_NAME' does not exist." >&2
+  echo "Create it first: useradd -m -s /bin/bash $USER_NAME" >&2
+  exit 1
+fi
+
+USER_HOME="$(getent passwd "$USER_NAME" | cut -d: -f6 || true)"
+if [ -z "${USER_HOME:-}" ] || [ ! -d "$USER_HOME" ]; then
+  echo "ERROR: Could not determine a valid home directory for '$USER_NAME' (got '$USER_HOME')." >&2
+  exit 1
+fi
+
+echo "Target user: ${USER_NAME}"
+echo "Home: ${USER_HOME}"
+
+# ---- fix common "Release file ... not valid yet" (bad clock) BEFORE apt ----
+if command -v timedatectl >/dev/null 2>&1; then
+  timedatectl set-ntp true || true
+fi
+if command -v systemctl >/dev/null 2>&1; then
+  systemctl restart systemd-timesyncd 2>/dev/null || true
+fi
+
+export DEBIAN_FRONTEND=noninteractive
+
+# ---- apt update (fail fast with a useful message if time is still wrong) ----
+if ! apt-get update; then
+  echo
+  echo "apt-get update failed. If you saw:"
+  echo "  'Release file ... is not valid yet'"
+  echo "your VM clock is wrong (usually ahead). Fix time, then rerun."
+  echo
+  echo "Try (as root):"
+  echo "  timedatectl set-ntp true"
+  echo "  systemctl restart systemd-timesyncd"
+  echo "  timedatectl"
+  echo "  date"
+  exit 1
+fi
+
+# ---- deps: telescope needs rg + fd; on Debian fd is fd-find (binary fdfind) ----
+apt-get install -y --no-install-recommends wget jq git tar ripgrep fd-find ca-certificates
+
+# provide a real `fd` in PATH for plugins that expect it
+ln -sf /usr/bin/fdfind /usr/local/bin/fd
+
+# ---- install latest Neovim to /opt/nvim + global symlink ----
+tag="$(wget -qO- https://api.github.com/repos/neovim/neovim/releases/latest | jq -r '.tag_name')"
+if [ -z "${tag:-}" ] || [ "$tag" = "null" ]; then
+  echo "ERROR: Failed to resolve Neovim latest release tag from GitHub API." >&2
+  exit 1
+fi
+
+tmp="$(mktemp -d)"
+cd "$tmp"
+
+downloaded="0"
+for asset in nvim-linux-x86_64.tar.gz nvim-linux64.tar.gz; do
+  url="https://github.com/neovim/neovim/releases/download/${tag}/${asset}"
+  if wget -q --spider "$url"; then
+    wget -qO nvim.tar.gz "$url"
+    downloaded="1"
+    break
+  fi
+done
+
+if [ "$downloaded" != "1" ]; then
+  echo "ERROR: Could not find Neovim release tarball for tag ${tag}." >&2
+  exit 1
+fi
+
+tar -xzf nvim.tar.gz
+
+rm -rf /opt/nvim
+mkdir -p /opt
+
+nvim_dir="$(find . -maxdepth 1 -type d -name 'nvim-linux*' | head -n 1 || true)"
+if [ -z "${nvim_dir:-}" ]; then
+  echo "ERROR: Extracted Neovim directory not found after untar." >&2
+  exit 1
+fi
+
+mv "$nvim_dir" /opt/nvim
+ln -sf /opt/nvim/bin/nvim /usr/local/bin/nvim
+
+echo "Neovim installed:"
+/usr/local/bin/nvim --version | head -n 1
+
+echo "Tools installed:"
+echo "  rg: $(command -v rg) ($(rg --version | head -n 1))"
+echo "  fd: $(command -v fd) ($(fd --version | head -n 1 || true))"
+
+# ---- wipe old nvim state for the user ----
+rm -rf "${USER_HOME}/.config/nvim" "${USER_HOME}/.local/share/nvim" "${USER_HOME}/.cache/nvim"
+mkdir -p "${USER_HOME}/.config/nvim"
+
+# ---- init.lua: which-key + neo-tree + telescope grep/find + cmp + themes
+#      Theme UI = Telescope picker, and it PERSISTS across restarts.
+cat > "${USER_HOME}/.config/nvim/init.lua" <<'LUA'
+vim.g.mapleader = " "
+vim.opt.number = true
+vim.opt.relativenumber = true
+vim.opt.termguicolors = true
+vim.opt.signcolumn = "yes"
+vim.opt.updatetime = 200
+vim.opt.clipboard = "" -- keep SSH sane
+
+-- ---------- persistent theme state ----------
+local statefile = vim.fn.stdpath("config") .. "/theme_state.lua"
+
+local function load_state()
+  local ok, t = pcall(dofile, statefile)
+  if ok and type(t) == "table" then return t end
+  return { colorscheme = "tokyonight", background = "dark" }
+end
+
+local function save_state(t)
+  local f = io.open(statefile, "w")
+  if not f then return end
+  local cs = tostring(t.colorscheme or "tokyonight"):gsub("\\", "\\\\"):gsub('"','\\"')
+  local bg = tostring(t.background or "dark"):gsub("\\", "\\\\"):gsub('"','\\"')
+  f:write('return { colorscheme = "' .. cs .. '", background = "' .. bg .. '" }\n')
+  f:close()
+end
+
+local THEME = load_state()
+vim.o.background = (THEME.background == "light") and "light" or "dark"
+
+local function apply_theme()
+  pcall(vim.cmd.colorscheme, THEME.colorscheme)
+end
+
+-- ---------- bootstrap lazy.nvim ----------
+local lazypath = vim.fn.stdpath("data") .. "/lazy/lazy.nvim"
+if not vim.loop.fs_stat(lazypath) then
+  vim.fn.system({
+    "git","clone","--filter=blob:none",
+    "https://github.com/folke/lazy.nvim.git",
+    "--branch=stable", lazypath,
+  })
+end
+vim.opt.rtp:prepend(lazypath)
+
+require("lazy").setup({
+  -- themes
+  { "folke/tokyonight.nvim", priority = 1000, lazy = false },
+  { "ellisonleao/gruvbox.nvim" },
+  { "rose-pine/neovim", name = "rose-pine" },
+  { "catppuccin/nvim", name = "catppuccin" },
+  { "tanvirtin/monokai.nvim" },
+
+  -- keybind popup
+  { "folke/which-key.nvim", opts = {} },
+
+  -- telescope (grep/find + theme picker UI)
+  { "nvim-lua/plenary.nvim" },
+  {
+    "nvim-telescope/telescope.nvim",
+    dependencies = { "nvim-lua/plenary.nvim" },
+    config = function()
+      require("telescope").setup({
+        defaults = {
+          vimgrep_arguments = {
+            "rg",
+            "--color=never",
+            "--no-heading",
+            "--with-filename",
+            "--line-number",
+            "--column",
+            "--smart-case",
+          },
+          file_ignore_patterns = { "%.git/" },
+        },
+        pickers = {
+          -- force fd so Debian works (we symlinked fd -> fdfind)
+          find_files = { find_command = { "fd", "--type", "f", "--hidden", "--follow" } },
+        },
+      })
+    end,
+  },
+
+  -- file tree
+  { "nvim-tree/nvim-web-devicons", lazy = true },
+  {
+    "nvim-neo-tree/neo-tree.nvim",
+    branch = "v3.x",
+    dependencies = {
+      "nvim-lua/plenary.nvim",
+      "nvim-tree/nvim-web-devicons",
+      "MunifTanjim/nui.nvim",
+    },
+    opts = {
+      filesystem = {
+        filtered_items = {
+          hide_dotfiles = false,
+          hide_gitignored = true,
+          never_show = { ".git" },
+        },
+      },
+      window = { width = 32 },
+    },
+  },
+
+  -- minimal autocomplete (buffer + path)
+  {
+    "hrsh7th/nvim-cmp",
+    dependencies = { "hrsh7th/cmp-buffer", "hrsh7th/cmp-path" },
+    config = function()
+      local cmp = require("cmp")
+      cmp.setup({
+        completion = { completeopt = "menu,menuone,noselect" },
+        mapping = cmp.mapping.preset.insert({
+          ["<C-Space>"] = cmp.mapping.complete(),
+          ["<CR>"] = cmp.mapping.confirm({ select = true }),
+          ["<Tab>"] = cmp.mapping(function(fallback)
+            if cmp.visible() then cmp.select_next_item() else fallback() end
+          end, { "i", "s" }),
+          ["<S-Tab>"] = cmp.mapping(function(fallback)
+            if cmp.visible() then cmp.select_prev_item() else fallback() end
+          end, { "i", "s" }),
+        }),
+        sources = cmp.config.sources({
+          { name = "path" },
+          { name = "buffer" },
+        }),
+      })
+    end,
+  },
+})
+
+-- Apply persisted theme AFTER plugins are on runtimepath
+vim.schedule(apply_theme)
+
+-- ---------- theme UI ----------
+local function theme_picker()
+  local ok_builtin, builtin = pcall(require, "telescope.builtin")
+  if not ok_builtin then return end
+  local ok_actions, actions = pcall(require, "telescope.actions")
+  local ok_state, action_state = pcall(require, "telescope.actions.state")
+  if not (ok_actions and ok_state) then return end
+
+  builtin.colorscheme({
+    enable_preview = true,
+    attach_mappings = function(prompt_bufnr, map)
+      local function choose()
+        local entry = action_state.get_selected_entry()
+        actions.close(prompt_bufnr)
+        if entry and entry.value then
+          THEME.colorscheme = entry.value
+          save_state(THEME)
+          apply_theme()
+        end
+      end
+      map("i", "<CR>", choose)
+      map("n", "<CR>", choose)
+      return true
+    end,
+  })
+end
+
+local function toggle_bg()
+  THEME.background = (THEME.background == "light") and "dark" or "light"
+  vim.o.background = THEME.background
+  save_state(THEME)
+  apply_theme()
+end
+
+-- ---------- keymaps ----------
+vim.keymap.set("n", "<leader>t", "<cmd>Neotree toggle<cr>", { desc = "File tree" })
+vim.keymap.set("n", "<leader>g", "<cmd>Telescope live_grep<cr>", { desc = "Grep" })
+vim.keymap.set("n", "<leader>f", "<cmd>Telescope find_files<cr>", { desc = "Find files" })
+
+-- Space+c opens a picker with preview, Enter selects & persists
+-- Space+C toggles dark/light & persists
+vim.keymap.set("n", "<leader>c", theme_picker, { desc = "Theme picker" })
+vim.keymap.set("n", "<leader>C", toggle_bg, { desc = "Toggle dark/light" })
+LUA
+
+mkdir -p "${USER_HOME}/.local" "${USER_HOME}/.cache"
+chown -R "${USER_NAME}:${USER_NAME}" "${USER_HOME}/.config" "${USER_HOME}/.local" "${USER_HOME}/.cache" || true
+
+echo
+echo "DONE."
+echo "Run:"
+echo "  su - ${USER_NAME}"
+echo "  nvim"
+echo
+echo "Keys:"
+echo "  Space+t  file tree"
+echo "  Space+g  grep"
+echo "  Space+f  find files"
+echo "  Space+c  theme picker (preview + persists)"
+echo "  Space+C  toggle dark/light (persists)"
+SCRIPT
