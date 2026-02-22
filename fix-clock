@@ -1,0 +1,11 @@
+# install time sync tooling
+apt-get update || true
+apt-get install -y systemd-timesyncd || true
+
+# enable NTP + force a resync
+timedatectl set-ntp true
+systemctl restart systemd-timesyncd || true
+
+# show current time/status
+timedatectl
+date
