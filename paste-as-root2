@@ -1,0 +1,144 @@
+# paste as root (or: sudo -i)
+bash -euxo pipefail <<'SCRIPT'
+USER_NAME="leif"
+USER_HOME="/home/${USER_NAME}"
+
+apt update
+apt install -y wget jq git tar ripgrep ca-certificates
+
+# ---- install latest Neovim to /opt/nvim and link /usr/local/bin/nvim ----
+tag="$(wget -qO- https://api.github.com/repos/neovim/neovim/releases/latest | jq -r '.tag_name')"
+
+tmp="$(mktemp -d)"
+cd "$tmp"
+
+# asset names vary; try a couple common ones
+for asset in nvim-linux-x86_64.tar.gz nvim-linux64.tar.gz; do
+  url="https://github.com/neovim/neovim/releases/download/${tag}/${asset}"
+  if wget -q --spider "$url"; then
+    wget -O nvim.tar.gz "$url"
+    break
+  fi
+done
+
+tar -xzf nvim.tar.gz
+
+rm -rf /opt/nvim
+mkdir -p /opt
+mv nvim-linux* /opt/nvim
+ln -sf /opt/nvim/bin/nvim /usr/local/bin/nvim
+
+echo "Neovim installed:"
+/usr/local/bin/nvim --version | head -n 1
+
+# ---- wipe old nvim state for the user ----
+rm -rf "${USER_HOME}/.config/nvim" "${USER_HOME}/.local/share/nvim" "${USER_HOME}/.cache/nvim"
+mkdir -p "${USER_HOME}/.config/nvim"
+
+# ---- minimal config: which-key + neo-tree + grep + 2-theme toggle + autocomplete (buffer/path) ----
+cat > "${USER_HOME}/.config/nvim/init.lua" <<'LUA'
+vim.g.mapleader = " "
+vim.opt.number = true
+vim.opt.relativenumber = true
+vim.opt.termguicolors = true
+vim.opt.signcolumn = "yes"
+vim.opt.updatetime = 200
+
+-- bootstrap lazy.nvim
+local lazypath = vim.fn.stdpath("data") .. "/lazy/lazy.nvim"
+if not vim.loop.fs_stat(lazypath) then
+  vim.fn.system({
+    "git","clone","--filter=blob:none",
+    "https://github.com/folke/lazy.nvim.git",
+    "--branch=stable", lazypath,
+  })
+end
+vim.opt.rtp:prepend(lazypath)
+
+-- two-theme toggle
+local THEMES = { "tokyonight", "gruvbox" }
+local theme_i = 1
+local function apply_theme()
+  pcall(vim.cmd.colorscheme, THEMES[theme_i])
+end
+local function toggle_theme()
+  theme_i = (theme_i % #THEMES) + 1
+  apply_theme()
+  vim.notify("Theme: " .. THEMES[theme_i])
+end
+
+require("lazy").setup({
+  -- themes
+  { "folke/tokyonight.nvim", priority = 1000 },
+  { "ellisonleao/gruvbox.nvim", priority = 999 },
+
+  -- keybind popup
+  { "folke/which-key.nvim", opts = {} },
+
+  -- fuzzy finder + grep (Space+g)
+  { "nvim-lua/plenary.nvim" },
+  { "nvim-telescope/telescope.nvim", dependencies = { "nvim-lua/plenary.nvim" } },
+
+  -- file tree (Space+t)
+  { "nvim-tree/nvim-web-devicons", lazy = true },
+  { "nvim-neo-tree/neo-tree.nvim", branch = "v3.x",
+    dependencies = { "nvim-lua/plenary.nvim", "nvim-tree/nvim-web-devicons", "MunifTanjim/nui.nvim" },
+    opts = {
+      filesystem = { filtered_items = { hide_dotfiles = false, hide_gitignored = true } },
+      window = { width = 32 },
+    },
+  },
+
+  -- minimal autocomplete (no LSP servers required)
+  { "hrsh7th/nvim-cmp",
+    dependencies = {
+      "hrsh7th/cmp-buffer",
+      "hrsh7th/cmp-path",
+    },
+    config = function()
+      local cmp = require("cmp")
+      cmp.setup({
+        completion = { completeopt = "menu,menuone,noselect" },
+        mapping = cmp.mapping.preset.insert({
+          ["<C-Space>"] = cmp.mapping.complete(),
+          ["<CR>"] = cmp.mapping.confirm({ select = true }),
+          ["<Tab>"] = cmp.mapping(function(fallback)
+            if cmp.visible() then cmp.select_next_item() else fallback() end
+          end, { "i", "s" }),
+          ["<S-Tab>"] = cmp.mapping(function(fallback)
+            if cmp.visible() then cmp.select_prev_item() else fallback() end
+          end, { "i", "s" }),
+        }),
+        sources = cmp.config.sources({
+          { name = "path" },
+          { name = "buffer" },
+        }),
+      })
+    end
+  },
+})
+
+apply_theme()
+
+-- keymaps (minimal, leader-based)
+vim.keymap.set("n", "<leader>t", "<cmd>Neotree toggle<cr>", { desc = "File tree" })
+vim.keymap.set("n", "<leader>g", "<cmd>Telescope live_grep<cr>", { desc = "Grep" })
+vim.keymap.set("n", "<leader>c", toggle_theme, { desc = "Toggle theme" })
+
+-- optional but handy (you said you don't care, but it stays minimal)
+vim.keymap.set("n", "<leader>f", "<cmd>Telescope find_files<cr>", { desc = "Find files" })
+LUA
+
+chown -R "${USER_NAME}:${USER_NAME}" "${USER_HOME}/.config" "${USER_HOME}/.local" "${USER_HOME}/.cache" || true
+
+echo
+echo "DONE. Next:"
+echo "  su - ${USER_NAME}"
+echo "  nvim"
+echo
+echo "In nvim:"
+echo "  Space+t  file tree"
+echo "  Space+g  grep"
+echo "  Space+c  toggle theme"
+echo "  Space+f  find files"
+SCRIPT
