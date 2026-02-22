@@ -1,0 +1,107 @@
+cat << 'EOF' > /root/install_nvim.sh
+#!/usr/bin/env bash
+set -euo pipefail
+
+USER_NAME="leif"
+USER_HOME="/home/${USER_NAME}"
+
+if [ "$(id -u)" -ne 0 ]; then
+  echo "Run as root."
+  exit 1
+fi
+
+echo "== Installing dependencies =="
+apt update
+apt install -y wget jq git tar ripgrep nodejs npm ca-certificates
+
+echo "== Installing latest Neovim =="
+
+tag="$(wget -qO- https://api.github.com/repos/neovim/neovim/releases/latest | jq -r '.tag_name')"
+
+tmp="$(mktemp -d)"
+cd "$tmp"
+
+asset="nvim-linux-x86_64.tar.gz"
+url="https://github.com/neovim/neovim/releases/download/${tag}/${asset}"
+
+if ! wget -O nvim.tar.gz "$url"; then
+  asset="nvim-linux64.tar.gz"
+  url="https://github.com/neovim/neovim/releases/download/${tag}/${asset}"
+  wget -O nvim.tar.gz "$url"
+fi
+
+tar -xzf nvim.tar.gz
+
+rm -rf /opt/nvim
+mkdir -p /opt
+mv nvim-linux* /opt/nvim
+
+ln -sf /opt/nvim/bin/nvim /usr/local/bin/nvim
+
+echo "Installed:"
+/usr/local/bin/nvim --version | head -n 1
+
+echo "== Installing global LSP deps =="
+npm install -g pyright
+
+echo "== Creating clean Neovim config for ${USER_NAME} =="
+
+rm -rf "${USER_HOME}/.config/nvim"
+rm -rf "${USER_HOME}/.local/share/nvim"
+rm -rf "${USER_HOME}/.cache/nvim"
+
+mkdir -p "${USER_HOME}/.config/nvim"
+
+cat > "${USER_HOME}/.config/nvim/init.lua" << 'EOC'
+vim.g.mapleader = " "
+vim.opt.number = true
+vim.opt.relativenumber = true
+vim.opt.termguicolors = true
+
+local lazypath = vim.fn.stdpath("data") .. "/lazy/lazy.nvim"
+if not vim.loop.fs_stat(lazypath) then
+  vim.fn.system({
+    "git",
+    "clone",
+    "--filter=blob:none",
+    "https://github.com/folke/lazy.nvim.git",
+    "--branch=stable",
+    lazypath,
+  })
+end
+vim.opt.rtp:prepend(lazypath)
+
+require("lazy").setup({
+  {
+    "folke/tokyonight.nvim",
+    priority = 1000,
+    config = function()
+      vim.cmd.colorscheme("tokyonight")
+    end
+  },
+  {
+    "nvim-treesitter/nvim-treesitter",
+    build = ":TSUpdate"
+  },
+  {
+    "neovim/nvim-lspconfig",
+    config = function()
+      vim.lsp.enable("lua_ls")
+      vim.lsp.enable("pyright")
+    end
+  }
+})
+EOC
+
+chown -R "${USER_NAME}:${USER_NAME}" "${USER_HOME}/.config" || true
+chown -R "${USER_NAME}:${USER_NAME}" "${USER_HOME}/.local" || true
+chown -R "${USER_NAME}:${USER_NAME}" "${USER_HOME}/.cache" || true
+
+echo "== DONE =="
+echo "Now run:"
+echo "su - ${USER_NAME}"
+echo "nvim"
+EOF
+
+chmod +x /root/install_nvim.sh
+bash /root/install_nvim.sh
